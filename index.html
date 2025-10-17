@@ -3,17 +3,24 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Event Scheduler</title>
+    <meta name="description" content="Pick your user and mark availability for events. Supabase-backed schedule helper.">
+    <meta name="theme-color" content="#0b1020">
+    <title>Pathfinder-finder</title>
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
-    <header class="site-header">
-      <h1 class="site-title">Event Scheduler</h1>
-      <div id="user-picker" class="user-picker" aria-label="Select user"></div>
+    <header class="site-header" role="banner">
+      <h1 class="site-title">Pathfinder-finder</h1>
+      <div id="user-picker" class="user-picker" role="group" aria-label="Select user"></div>
+      <div id="event-picker" class="event-picker" role="group" aria-label="Select event"></div>
     </header>
-    <main class="content">
+    <main class="content" role="main">
       <section id="status" class="status">Loading users…</section>
-      <section id="events" class="events"></section>
+      <div id="status-sub" class="status-sub"></div>
+      <section id="calendar" class="calendar">
+        <div id="calendar-weekdays" class="calendar-weekdays"></div>
+        <div id="calendar-grid" class="calendar-grid"></div>
+      </section>
     </main>
     <script type="module" src="app.js"></script>
   </body>
