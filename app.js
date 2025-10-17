@@ -26,9 +26,29 @@ function computeSlotViability(selectedEvent, slot, dateObj, saved) {
   const totalMembers = state.eventMemberCountByEventId[selectedEvent.id] || 0;
   const maxUnavailable = Number(selectedEvent.max_unavailable ?? 1);
   const requiredAvail = Math.max(0, totalMembers - maxUnavailable);
+
   if (!(totalMembers > 0 && requiredAvail > 0)) return { status: SlotViability.UNKNOWN };
-  if (availCount >= requiredAvail) return { status: SlotViability.VIABLE };
-  if (saved !== true && (availCount + 1 >= requiredAvail)) return { status: SlotViability.VIABLE_WITH_YOU };
+
+  // Enforce: all required members must be available for a slot to be viable
+  const requiredSet = state.requiredMemberIdsByEventId[selectedEvent.id] || new Set();
+  const availableUsers = state.availableUsersByKey[key] || new Set();
+  const allRequiredAvailable = [...requiredSet].every(uid => availableUsers.has(uid));
+
+  // Current viability considering both thresholds
+  const meetsCount = availCount >= requiredAvail;
+  if (meetsCount && allRequiredAvailable) return { status: SlotViability.VIABLE };
+
+  // Hypothetical: if you mark available (only when you haven't already saved true)
+  const userId = state.selectedUserId;
+  const youAreAlreadyAvailable = saved === true || availableUsers.has(userId);
+  if (!youAreAlreadyAvailable) {
+    const meetsCountWithYou = (availCount + 1) >= requiredAvail;
+    const allRequiredAvailableWithYou = [...requiredSet].every(uid => uid === userId || availableUsers.has(uid));
+    if (meetsCountWithYou && allRequiredAvailableWithYou) {
+      return { status: SlotViability.VIABLE_WITH_YOU };
+    }
+  }
+
   return { status: SlotViability.NOT_VIABLE };
 }
 
@@ -89,6 +109,7 @@ async function onSelectEvent(eventId) {
     loadUnavailabilityCounts(eventId),
     loadAvailabilityCounts(eventId),
     loadUnavailableUsers(eventId),
+    loadAvailableUsers(eventId),
   ]);
   renderCalendar();
   renderStatusSub();
@@ -114,6 +135,7 @@ const state = {
   availabilityCounts: {},   // key: eventId:slotId:YYYY-MM-DD -> count of available=true
   requiredMemberIdsByEventId: {}, // eventId -> Set(userId)
   unavailableUsersByKey: {}, // key -> Set(userId) who marked unavailable
+  availableUsersByKey: {}, // key -> Set(userId) who marked available
 };
 
 const els = {
@@ -672,6 +694,26 @@ async function loadAvailabilityCounts(eventId) {
   state.availabilityCounts = counts;
 }
 
+async function loadAvailableUsers(eventId) {
+  const { data, error } = await supabase
+    .from('availability_note')
+    .select('user, slot, date, available')
+    .eq('event', eventId)
+    .eq('available', true);
+  if (error) {
+    console.error(error);
+    state.availableUsersByKey = {};
+    return;
+  }
+  const map = {};
+  for (const row of data || []) {
+    const key = slotDateKey(eventId, row.slot, row.date);
+    if (!map[key]) map[key] = new Set();
+    map[key].add(row.user);
+  }
+  state.availableUsersByKey = map;
+}
+
 async function loadRequiredMembers(eventId) {
   const { data, error } = await supabase
     .from('event_members')
@@ -792,6 +834,7 @@ async function refreshCountsAndCalendar(eventId) {
     loadUnavailabilityCounts(eventId),
     loadAvailabilityCounts(eventId),
     loadUnavailableUsers(eventId),
+    loadAvailableUsers(eventId),
   ]);
   renderCalendar();
   renderStatusSub();
