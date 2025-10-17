@@ -3,6 +3,59 @@ import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+/** @readonly */
+const SlotViability = Object.freeze({
+  VIABLE: 'viable',
+  VIABLE_WITH_YOU: 'viable_with_you',
+  NOT_VIABLE: 'not_viable',
+  UNKNOWN: 'unknown',
+});
+
+function getSelectedEvent() {
+  return state.events.find(e => String(e.id) === String(state.selectedEventId)) || null;
+}
+
+function slotDateKey(eventId, slotId, dateOrString) {
+  const dateStr = typeof dateOrString === 'string' ? dateOrString : toISODate(dateOrString);
+  return `${eventId}:${slotId}:${dateStr}`;
+}
+
+function computeSlotViability(selectedEvent, slot, dateObj, saved) {
+  const key = slotDateKey(selectedEvent.id, slot.id, dateObj);
+  const availCount = state.availabilityCounts[key] || 0;
+  const totalMembers = state.eventMemberCountByEventId[selectedEvent.id] || 0;
+  const maxUnavailable = Number(selectedEvent.max_unavailable ?? 1);
+  const requiredAvail = Math.max(0, totalMembers - maxUnavailable);
+  if (!(totalMembers > 0 && requiredAvail > 0)) return { status: SlotViability.UNKNOWN };
+  if (availCount >= requiredAvail) return { status: SlotViability.VIABLE };
+  if (saved !== true && (availCount + 1 >= requiredAvail)) return { status: SlotViability.VIABLE_WITH_YOU };
+  return { status: SlotViability.NOT_VIABLE };
+}
+
+async function applyAvailability(userId, eventId, slotId, dateObj, value /* boolean | undefined */) {
+  if (value === undefined) {
+    await clearAvailabilityServer(userId, eventId, slotId, dateObj);
+    state.availabilityByKey[availabilityKey(userId, eventId, slotId, dateObj)] = undefined;
+  } else {
+    await upsertAvailability(userId, eventId, slotId, dateObj, value);
+    state.availabilityByKey[availabilityKey(userId, eventId, slotId, dateObj)] = value;
+  }
+}
+
+function forEachVisibleFutureSlotsInWeek(weekStartDate, selectedEvent, fn /* (day, slot) => void */) {
+  const today = new Date();
+  for (let offset = 0; offset < 7; offset++) {
+    const day = new Date(weekStartDate);
+    day.setDate(weekStartDate.getDate() + offset);
+    if (isPastDate(day, today)) continue;
+    const slots = getSlotsForDate(selectedEvent.id, day);
+    for (const s of slots) {
+      if (!isSlotVisibleForUser(selectedEvent, s, day)) continue;
+      fn(day, s);
+    }
+  }
+}
+
 function renderEventPicker(preselectId) {
   els.eventPicker.innerHTML = '';
   state.events.forEach((ev) => {
@@ -359,43 +412,27 @@ function renderCalendar() {
     if (isToday) cell.classList.add('day-today');
 
     // Timeslots from normalized weekly_event_slot (Mon=0)
-    const selectedEvent = state.events.find(e => String(e.id) === String(state.selectedEventId));
+    const selectedEvent = getSelectedEvent();
     const slots = getSlotsForDate(selectedEvent?.id, d);
     for (const s of slots) {
       // Skip slots in the past
       if (isPast) continue;
 
-      // Skip slots that exceed event.max_unavailable, unless current user marked unavailable (to allow them to change it)
-      const key = `${selectedEvent.id}:${s.id}:${toISODate(d)}`;
-      const unavailableCount = state.unavailabilityCounts[key] || 0;
-      const maxUnavailable = Number(selectedEvent.max_unavailable ?? 1);
-      const userKey = availabilityKey(state.selectedUserId, selectedEvent.id, s.id, d);
-      const userHasUnavailable = state.availabilityByKey[userKey] === false;
-      if (unavailableCount > maxUnavailable && !userHasUnavailable) continue;
-
-      // Hide if any required member has marked unavailable, except for that required user themself
-      const requiredSet = state.requiredMemberIdsByEventId[selectedEvent.id] || new Set();
-      const unavailableUsers = state.unavailableUsersByKey[key] || new Set();
-      const someoneRequiredUnavailable = [...unavailableUsers].some(uid => requiredSet.has(uid) && String(uid) !== String(state.selectedUserId));
-      if (someoneRequiredUnavailable) continue;
+      // Respect slot visibility constraints for the current user
+      if (!isSlotVisibleForUser(selectedEvent, s, d)) continue;
 
       const slot = document.createElement('div');
       slot.className = 'slot';
       // Highlight logic (gold or dashed hint)
-      const availKey = `${selectedEvent.id}:${s.id}:${toISODate(d)}`;
-      const availCount = state.availabilityCounts[availKey] || 0;
-      const totalMembers = state.eventMemberCountByEventId[selectedEvent.id] || 0; // optional, if needed in future
-      const requiredAvail = Math.max(0, totalMembers - maxUnavailable);
       const saved = state.availabilityByKey[availabilityKey(state.selectedUserId, selectedEvent.id, s.id, d)];
       let viabilityNote = '';
-      if (totalMembers > 0 && requiredAvail > 0) {
-        if (availCount >= requiredAvail) {
-          slot.classList.add('slot-gold');
-          viabilityNote = '🥳 Viable!';
-        } else if (saved !== true && (availCount + 1 >= requiredAvail)) {
-          slot.classList.add('slot-gold-hint');
-          viabilityNote = '🥺 Viable with you';
-        }
+      const { status: viability } = computeSlotViability(selectedEvent, s, d, saved);
+      if (viability === SlotViability.VIABLE) {
+        slot.classList.add('slot-gold');
+        viabilityNote = '🥳 Viable!';
+      } else if (viability === SlotViability.VIABLE_WITH_YOU) {
+        slot.classList.add('slot-gold-hint');
+        viabilityNote = '🥺 Viable with you';
       }
       const left = document.createElement('div');
       left.style.display = 'flex';
@@ -426,33 +463,27 @@ function renderCalendar() {
 
       okBtn.addEventListener('click', async () => {
         if (okBtn.classList.contains('active')) {
-          await clearAvailabilityServer(state.selectedUserId, selectedEvent.id, s.id, d);
+          await applyAvailability(state.selectedUserId, selectedEvent.id, s.id, d, undefined);
           okBtn.classList.remove('active');
           noBtn.classList.remove('active');
-          state.availabilityByKey[availabilityKey(state.selectedUserId, selectedEvent.id, s.id, d)] = undefined;
-          await refreshCountsAndCalendar(selectedEvent.id);
         } else {
-          await upsertAvailability(state.selectedUserId, selectedEvent.id, s.id, d, true);
+          await applyAvailability(state.selectedUserId, selectedEvent.id, s.id, d, true);
           okBtn.classList.add('active');
           noBtn.classList.remove('active');
-          state.availabilityByKey[availabilityKey(state.selectedUserId, selectedEvent.id, s.id, d)] = true;
-          await refreshCountsAndCalendar(selectedEvent.id);
         }
+        await refreshCountsAndCalendar(selectedEvent.id);
       });
       noBtn.addEventListener('click', async () => {
         if (noBtn.classList.contains('active')) {
-          await clearAvailabilityServer(state.selectedUserId, selectedEvent.id, s.id, d);
+          await applyAvailability(state.selectedUserId, selectedEvent.id, s.id, d, undefined);
           noBtn.classList.remove('active');
           okBtn.classList.remove('active');
-          state.availabilityByKey[availabilityKey(state.selectedUserId, selectedEvent.id, s.id, d)] = undefined;
-          await refreshCountsAndCalendar(selectedEvent.id);
         } else {
-          await upsertAvailability(state.selectedUserId, selectedEvent.id, s.id, d, false);
+          await applyAvailability(state.selectedUserId, selectedEvent.id, s.id, d, false);
           noBtn.classList.add('active');
           okBtn.classList.remove('active');
-          state.availabilityByKey[availabilityKey(state.selectedUserId, selectedEvent.id, s.id, d)] = false;
-          await refreshCountsAndCalendar(selectedEvent.id);
         }
+        await refreshCountsAndCalendar(selectedEvent.id);
       });
 
       actions.appendChild(okBtn);
@@ -487,23 +518,13 @@ function getISOWeekNumber(d) {
 }
 
 function getWeekStatus(weekStartDate) {
-  const selectedEvent = state.events.find(e => String(e.id) === String(state.selectedEventId));
+  const selectedEvent = getSelectedEvent();
   if (!selectedEvent) return 'mixed';
-  const userId = state.selectedUserId;
-  const today = new Date();
   const values = [];
-  for (let offset = 0; offset < 7; offset++) {
-    const day = new Date(weekStartDate);
-    day.setDate(weekStartDate.getDate() + offset);
-    if (isPastDate(day, today)) continue;
-    const slots = getSlotsForDate(selectedEvent.id, day);
-    for (const s of slots) {
-      if (!isSlotVisibleForUser(selectedEvent, s, day)) continue;
-      const key = availabilityKey(userId, selectedEvent.id, s.id, day);
-      const v = state.availabilityByKey[key];
-      values.push(v);
-    }
-  }
+  forEachVisibleFutureSlotsInWeek(weekStartDate, selectedEvent, (day, s) => {
+    const key = availabilityKey(state.selectedUserId, selectedEvent.id, s.id, day);
+    values.push(state.availabilityByKey[key]);
+  });
   if (values.length === 0) return 'mixed';
   const allTrue = values.every(v => v === true);
   const allFalse = values.every(v => v === false);
@@ -513,57 +534,33 @@ function getWeekStatus(weekStartDate) {
 }
 
 async function setWeekAvailability(weekStartDate, available) {
-  const selectedEvent = state.events.find(e => String(e.id) === String(state.selectedEventId));
+  const selectedEvent = getSelectedEvent();
   if (!selectedEvent) return;
   const userId = state.selectedUserId;
   // Iterate Mon..Sun for that week
   const ops = [];
-  for (let offset = 0; offset < 7; offset++) {
-    const day = new Date(weekStartDate);
-    day.setDate(weekStartDate.getDate() + offset);
-    // skip past days
-    const today = new Date();
-    if (isPastDate(day, today)) continue;
-    const slots = getSlotsForDate(selectedEvent.id, day);
-    for (const s of slots) {
-      if (!isSlotVisibleForUser(selectedEvent, s, day)) continue;
-      const key = availabilityKey(userId, selectedEvent.id, s.id, day);
-      const current = state.availabilityByKey[key];
-      if (current === available) continue;
-      if (current === undefined) {
-        ops.push(upsertAvailability(userId, selectedEvent.id, s.id, day, available));
-        state.availabilityByKey[key] = available;
-      } else if (current !== available) {
-        ops.push(upsertAvailability(userId, selectedEvent.id, s.id, day, available));
-        state.availabilityByKey[key] = available;
-      }
-    }
-  }
+  forEachVisibleFutureSlotsInWeek(weekStartDate, selectedEvent, (day, s) => {
+    const key = availabilityKey(userId, selectedEvent.id, s.id, day);
+    const current = state.availabilityByKey[key];
+    if (current === available) return;
+    ops.push(applyAvailability(userId, selectedEvent.id, s.id, day, available));
+  });
   if (ops.length) await Promise.all(ops);
   await refreshCountsAndCalendar(selectedEvent.id);
 }
 
 async function clearWeekAvailability(weekStartDate, valueToClear) {
-  const selectedEvent = state.events.find(e => String(e.id) === String(state.selectedEventId));
+  const selectedEvent = getSelectedEvent();
   if (!selectedEvent) return;
   const userId = state.selectedUserId;
   const ops = [];
-  const today = new Date();
-  for (let offset = 0; offset < 7; offset++) {
-    const day = new Date(weekStartDate);
-    day.setDate(weekStartDate.getDate() + offset);
-    if (isPastDate(day, today)) continue;
-    const slots = getSlotsForDate(selectedEvent.id, day);
-    for (const s of slots) {
-      if (!isSlotVisibleForUser(selectedEvent, s, day)) continue;
-      const key = availabilityKey(userId, selectedEvent.id, s.id, day);
-      const current = state.availabilityByKey[key];
-      if (current === undefined) continue;
-      if (valueToClear !== undefined && current !== valueToClear) continue;
-      ops.push(clearAvailabilityServer(userId, selectedEvent.id, s.id, day));
-      state.availabilityByKey[key] = undefined;
-    }
-  }
+  forEachVisibleFutureSlotsInWeek(weekStartDate, selectedEvent, (day, s) => {
+    const key = availabilityKey(userId, selectedEvent.id, s.id, day);
+    const current = state.availabilityByKey[key];
+    if (current === undefined) return;
+    if (valueToClear !== undefined && current !== valueToClear) return;
+    ops.push(applyAvailability(userId, selectedEvent.id, s.id, day, undefined));
+  });
   if (ops.length) await Promise.all(ops);
   await refreshCountsAndCalendar(selectedEvent.id);
 }
@@ -571,7 +568,7 @@ async function clearWeekAvailability(weekStartDate, valueToClear) {
 function isSlotVisibleForUser(selectedEvent, slot, dateObj) {
   const today = new Date();
   if (isPastDate(dateObj, today)) return false;
-  const key = `${selectedEvent.id}:${slot.id}:${toISODate(dateObj)}`;
+  const key = slotDateKey(selectedEvent.id, slot.id, dateObj);
   const unavailableCount = state.unavailabilityCounts[key] || 0;
   const maxUnavailable = Number(selectedEvent.max_unavailable ?? 1);
   const userHasUnavailable = state.availabilityByKey[availabilityKey(state.selectedUserId, selectedEvent.id, slot.id, dateObj)] === false;
@@ -649,7 +646,7 @@ async function loadUnavailabilityCounts(eventId) {
   }
   const counts = {};
   for (const row of data || []) {
-    const key = `${eventId}:${row.slot}:${row.date}`;
+    const key = slotDateKey(eventId, row.slot, row.date);
     counts[key] = (counts[key] || 0) + 1;
   }
   state.unavailabilityCounts = counts;
@@ -669,7 +666,7 @@ async function loadAvailabilityCounts(eventId) {
   }
   const counts = {};
   for (const row of data || []) {
-    const key = `${eventId}:${row.slot}:${row.date}`;
+    const key = slotDateKey(eventId, row.slot, row.date);
     counts[key] = (counts[key] || 0) + 1;
   }
   state.availabilityCounts = counts;
@@ -702,7 +699,7 @@ async function loadUnavailableUsers(eventId) {
   }
   const map = {};
   for (const row of data || []) {
-    const key = `${eventId}:${row.slot}:${row.date}`;
+    const key = slotDateKey(eventId, row.slot, row.date);
     if (!map[key]) map[key] = new Set();
     map[key].add(row.user);
   }
@@ -769,7 +766,7 @@ function formatSlotTime(t) {
 }
 
 function renderStatusSub() {
-  const ev = state.events.find(e => String(e.id) === String(state.selectedEventId));
+  const ev = getSelectedEvent();
   if (!ev) {
     els.statusSub.textContent = '';
     return;
