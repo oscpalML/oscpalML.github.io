@@ -119,7 +119,7 @@ body {
 .calendar-grid {
   display: grid;
   grid-template-columns: 64px repeat(7, 1fr);
-  grid-auto-rows: 120px;
+  grid-auto-rows: minmax(120px, auto);
   gap: 8px;
 }
 
